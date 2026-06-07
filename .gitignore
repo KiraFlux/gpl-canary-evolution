@@ -8,3 +8,4 @@ genes/*
 
 snapshots/*
 !snapshots/README
+*.cpython-314.pyc
