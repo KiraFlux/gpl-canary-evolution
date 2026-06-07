@@ -1,10 +1,9 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from dataclasses import dataclass, field
-from itertools import chain
+from itertools import chain, cycle
 from pathlib import Path
 from openai import OpenAI
-from typing import Callable, Optional, ClassVar
+from typing import Callable, Optional
 import secrets
 
 _root_dir = Path(".").resolve().absolute()
@@ -16,11 +15,6 @@ _gene_placeholder = "GPL_CANARY_EVOLUTION_PROJECT_GENE_PLACEHOLDER"
 
 _snapshots_dir = _root_dir / "snapshots"
 _snapshot_max_len = 4000
-
-_client = OpenAI(
-    api_key=secrets.llm_api_key_v2,
-    base_url="https://openrouter.ai/api/v1",
-)
 
 
 def _load_gene(name: str) -> str:
@@ -44,35 +38,7 @@ def _load_snapshot(name: str) -> str:
 
 
 def _make_message(role: str, content: str):
-    return {"role": role, "content": content, }
-
-
-def _ask_llm(llm: str, content: str, user_prompt: str, system_prompt: str, on_delta: Callable[[str], bool]):
-    full = content + "\n\n" + user_prompt
-
-    stream = _client.chat.completions.create(
-        model=llm,
-        messages=[
-            _make_message("system", system_prompt),
-            _make_message("user", full)
-        ],
-        stream=True,
-        temperature=0.0,
-    )
-
-    for chunk in stream:
-        delta_content = chunk.choices[0].delta.content
-
-        if delta_content is not None:
-            need_to_stop = on_delta(delta_content)
-
-            if need_to_stop:
-                break
-
-
-def _flushed_log(delta: str) -> bool:
-    print(delta, end="", flush=True)
-    return False
+    return {"role": role, "content": content}
 
 
 @dataclass(kw_only=True)
@@ -104,11 +70,11 @@ class AskContext:
     def text(self) -> str:
         return self._accumulated_text
 
-    def run(self):
+    def run(self, client: OpenAI):
         print(f"start: {self.key}")
 
         self._start_time = time.time()
-        _ask_llm(self.llm, self.content, self.user_prompt, self.system_prompt, self._on_delta)
+        self._ask_llm(client)
         self._end_time = time.time()
 
         return self
@@ -121,53 +87,72 @@ class AskContext:
 
         return self.is_refusal()
 
+    def _ask_llm(self, client: OpenAI):
+        full = self.content + "\n\n" + self.user_prompt
+
+        stream = client.chat.completions.create(
+            model=self.llm,
+            messages=[
+                _make_message("system", self.system_prompt),
+                _make_message("user", full)
+            ],
+            stream=True,
+            temperature=0.0,
+        )
+
+        for chunk in stream:
+            delta_content = chunk.choices[0].delta.content
+            if delta_content is not None:
+                need_to_stop = self._on_delta(delta_content)
+                if need_to_stop:
+                    break
+
 
 def _start():
     def f(p: Path):
         return p.suffix != ".dis"
 
     original_snapshot = _load_snapshot(secrets.snapshot_name)
-    prompt_paths = tuple[Path](filter(
-        f,
-        (chain((_prompt_dir / "attacker").glob("*"), (_prompt_dir / "harmless").glob("*")))
-    ))
-    system_prompt_paths = tuple[Path](filter(
-        f,
-        (_prompt_dir / "system").glob("*")
-    ))
 
-    print('\n'.join(map(str, prompt_paths + system_prompt_paths)))
+    prompt_paths = tuple(
+        filter(f, chain((_prompt_dir / "attacker").glob("*"), (_prompt_dir / "harmless").glob("*")))
+    )
+    system_prompt_paths = tuple(filter(f, (_prompt_dir / "system").glob("*")))
 
     root_gene = _load_gene("root")
     poisoned_snapshot = _insert_gene(original_snapshot, root_gene)
 
-    ask_contexts = tuple(
-        AskContext(
-            key=f"{llm} sys:{system_prompt_path.relative_to(_root_dir)} usr:{user_prompt_path.relative_to(_root_dir)}",
-            llm=llm,
-            content=poisoned_snapshot,
-            user_prompt=user_prompt_path.read_text(),
-            system_prompt=system_prompt_path.read_text(),
+    clients = cycle(
+        tuple(
+            OpenAI(
+                api_key=api_key,
+                base_url="https://openrouter.ai/api/v1",
+            )
+            for api_key in secrets.llm_api_keys
         )
-        for user_prompt_path in prompt_paths
-        for system_prompt_path in system_prompt_paths
-        for llm in secrets.llm_names
     )
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = list()
+    for llm in secrets.llm_names:
+        for system_prompt_path in system_prompt_paths:
+            system_prompt = system_prompt_path.read_text()
+            for user_prompt_path in prompt_paths:
+                user_prompt = user_prompt_path.read_text()
 
-        for ask in ask_contexts:
-            time.sleep(1.0)
-            print(f"submitted: {ask.key}")
-            futures.append(executor.submit(ask.run))
+                ask = AskContext(
+                    key=f"{llm} sys:{system_prompt_path.relative_to(_root_dir)} usr:{user_prompt_path.relative_to(_root_dir)}",
+                    llm=llm,
+                    content=poisoned_snapshot,
+                    user_prompt=user_prompt,
+                    system_prompt=system_prompt,
+                )
+                ask.run(next(clients))
 
-        for future in as_completed(futures):
-            ask: AskContext = future.result()
+                print(ask.key)
+                print(
+                    f"  duration={ask.calc_duration() or 0.0 :.2f}s, ttfb={ask.calc_ttfb() or 0.0 :.2f}s, refusal={ask.is_refusal()}")
+                print(f"  preview: {ask.text[:200].replace('\n', ' ')}...\n")
+                time.sleep(0.5)
 
-            print(f"ask: {ask.key}\n{ask.calc_duration()=}\t{ask.calc_ttfb()=}\t{ask.is_refusal()=}\n{ask.text}")
 
-    return
-
-
-_start()
+if __name__ == "__main__":
+    _start()
