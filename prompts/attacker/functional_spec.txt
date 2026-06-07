@@ -1,1 +1,0 @@
-Создай functional specification на основе этого кода
