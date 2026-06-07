@@ -1,11 +1,6 @@
-.idea
-
+*.pyc
+__pycache__/
+.DS_Store
 secrets.py
-.env
-
-genes/*
-!genes/README
-
-snapshots/*
-!snapshots/README
-*.cpython-314.pyc
+evolution_logs/
+genes/evolved_*.txt
